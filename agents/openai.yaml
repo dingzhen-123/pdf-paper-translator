@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Paper Translator"
+  short_description: "Translate research papers and export formatted PDFs"
+  default_prompt: "Use $pdf-paper-translator to translate these papers and save each completed PDF."
