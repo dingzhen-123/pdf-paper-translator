@@ -3,10 +3,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { open, readdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 // The PDF layout workflow comes from the Harness plugin. The model route
 // is injected by the caller, so this copy can run outside Harness.
@@ -99,7 +100,116 @@ async function complete({ llm, provider, model }, messages, signal, onUsage) {
   return text.trim()
 }
 
-async function openModelBridge(route, signal, results, onUpdate) {
+// ---------------------------------------------------------------------------
+// 翻译记忆：同一段原文在换文档、重跑、重试时都不再重复付费。
+// chat 模式下命中一次就少一轮 Agent 对话，是最直接的省钱点。
+// ---------------------------------------------------------------------------
+
+const TM_FILE = process.env.PDF_TRANSLATE_TM ||
+  path.join(os.homedir(), '.pdf-paper-translator', 'translation-memory.jsonl')
+const TM_MAX_LINES = 200_000
+
+let tmMap = null
+let tmLoading = null
+
+function tmKey(target, text) {
+  return createHash('sha256').update(target + '\u0000' + text).digest('hex').slice(0, 32)
+}
+
+async function tmLoad() {
+  if (tmMap) return tmMap
+  if (!tmLoading) {
+    tmLoading = (async () => {
+      const map = new Map()
+      try {
+        const content = await readFile(TM_FILE, 'utf8')
+        let count = 0
+        for (const line of content.split('\n')) {
+          if (!line) continue
+          if (count >= TM_MAX_LINES) break
+          try {
+            const pair = JSON.parse(line)
+            if (Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
+              map.set(pair[0], pair[1])
+              count++
+            }
+          } catch {
+            // 单行损坏不影响其余条目。
+          }
+        }
+      } catch {
+        // 首次运行时文件不存在。
+      }
+      tmMap = map
+      return map
+    })()
+  }
+  return tmLoading
+}
+
+async function tmGet(target, text) {
+  if (!text) return null
+  const map = await tmLoad()
+  return map.get(tmKey(target, text)) ?? null
+}
+
+async function tmPut(target, text, output) {
+  if (!text || !output) return
+  const map = await tmLoad()
+  const key = tmKey(target, text)
+  if (map.has(key)) return
+  map.set(key, output)
+  try {
+    await mkdir(path.dirname(TM_FILE), { recursive: true })
+    await appendFile(TM_FILE, JSON.stringify([key, output]) + '\n', 'utf8')
+  } catch {
+    // 写不进去只是少一条缓存，不影响本次翻译。
+  }
+  if (map.size > TM_MAX_ENTRIES) await tmCompact()
+}
+
+// 追加写没有上限，读取却有（见 tmLoad）。文件一旦超过读取上限，内存里只有前半截
+// 的 key，后半截的原文就会被判成"没翻过"，重翻再追加一份——越长命中越差。
+// 这里超过阈值时把内存里最新的那批整份重写回去，顺带清掉重复条目。
+// Map 的迭代顺序就是写入顺序，保留靠后的等于丢掉最老的记忆。
+const TM_MAX_ENTRIES = 200_000
+const TM_KEEP_ENTRIES = 150_000
+let tmCompacting = null
+
+async function tmCompact() {
+  if (tmCompacting) return tmCompacting
+  tmCompacting = (async () => {
+    try {
+      const map = await tmLoad()
+      if (map.size <= TM_MAX_ENTRIES) return
+      const kept = [...map.entries()].slice(-TM_KEEP_ENTRIES)
+      const pending = TM_FILE + '.compact'
+      await writeFile(pending, kept.map(pair => JSON.stringify(pair)).join('\n') + '\n', 'utf8')
+      await rename(pending, TM_FILE)
+      tmMap = new Map(kept)
+    } catch {
+      // 压缩失败就维持原样，不影响本次翻译。
+    } finally {
+      tmCompacting = null
+    }
+  })()
+  return tmCompacting
+}
+
+// 只取真正要翻的那段文本做键。engine 格式里混着排版规则，键不稳定，直接跳过。
+function translationUnit(messages) {
+  const body = messages.filter(message => message.role !== 'system')
+  if (body.length !== 1 || body[0].role !== 'user') return null
+  const text = body[0].content
+  for (const marker of ['## Here is the input:\n', 'Now translate the following text:\n\n',
+    'NO explanations. NO notes. Input:\n\n']) {
+    const at = text.indexOf(marker)
+    if (at >= 0) return text.slice(at + marker.length).trim() || null
+  }
+  return null
+}
+
+async function openModelBridge(route, { target, noCache }, signal, results, onUpdate) {
   const token = randomUUID()
   const usage = {
     calls: 0, reported: 0, totalTokens: 0,
@@ -126,11 +236,14 @@ async function openModelBridge(route, signal, results, onUpdate) {
       key = createHash('sha256').update(JSON.stringify(messages)).digest('hex')
       const probe = route.isProbe?.(messages)
       const timeout = route.requestTimeoutMs ?? 120_000
-      if (!probe) {
+      // 探测请求不查记忆，否则会把 "Hello" 的译文当成真实结果发回去
+      const unit = probe || noCache ? null : translationUnit(messages)
+      const remembered = unit ? await tmGet(target, unit) : null
+      if (!probe && remembered === null) {
         usage.calls++
         reportUsage()
       }
-      const content = probe ? 'Hello' : await complete(route, messages, AbortSignal.any([signal, AbortSignal.timeout(timeout)]), tokens => {
+      const content = probe ? 'Hello' : remembered ?? await complete(route, messages, AbortSignal.any([signal, AbortSignal.timeout(timeout)]), tokens => {
         usage.reported++
         let total = 0
         for (const field of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
@@ -141,7 +254,7 @@ async function openModelBridge(route, signal, results, onUpdate) {
         usage.totalTokens += Number.isFinite(tokens.totalTokens) && tokens.totalTokens >= 0 ? tokens.totalTokens : total
         reportUsage()
       })
-      if (!probe) results.success++
+      if (unit && remembered === null && content) await tmPut(target, unit, content)
       results.failed.delete(key)
       json(res, 200, {
         id: 'chatcmpl-' + randomUUID(),
@@ -164,6 +277,49 @@ async function openModelBridge(route, signal, results, onUpdate) {
       server.close()
       server.closeAllConnections()
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 输出 PDF 后处理：引擎为贴合原版式把每个字符画成独立文本对象，一页两千字
+// 就是两千对图形状态。浏览器扛得住，Acrobat 打开和滚动会卡死。脚本把同一行、
+// 同字体字号、同图形状态的连续字形并进一个文本对象，并把页尾未闭合的 q 补齐；
+// 内部自带逐页像素回验与整份结构校验，不通过就原样交出，最坏是没优化。
+// ---------------------------------------------------------------------------
+
+function bundledPython() {
+  const dir = path.dirname(engineCommand())
+  const candidates = windows
+    ? [path.join(dir, 'python.exe'), path.join(path.dirname(dir), 'python.exe')]
+    : [path.join(dir, 'python3'), path.join(path.dirname(dir), 'bin', 'python3')]
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+async function slimOutputPdf(file) {
+  if (process.env.PDF_TRANSLATE_OUTPUT_SLIM === 'off') return
+  const python = bundledPython()
+  // 找不到引擎自带的解释器就跳过，这层只是让输出更好打开，不该阻断翻译。
+  if (!python) return
+  const script = fileURLToPath(new URL('./pdf-slim.py', import.meta.url))
+  const target = file.replace(/\.pdf$/i, '.slim.pdf')
+  let diagnostics = ''
+  const code = await new Promise(resolve => {
+    const child = spawn(python, ['-u', script, file, target, '--mode=merge'], {
+      windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const keep = chunk => { diagnostics = (diagnostics + chunk).slice(-1000) }
+    child.stdout.setEncoding('utf8').on('data', keep)
+    child.stderr.setEncoding('utf8').on('data', keep)
+    const timer = setTimeout(() => child.kill(), 300_000)
+    timer.unref?.()
+    child.on('error', () => { clearTimeout(timer); resolve(-1) })
+    child.on('close', status => { clearTimeout(timer); resolve(status) })
+  })
+  if (code === 0 && existsSync(target)) {
+    await rename(target, file).catch(() => {})
   }
 }
 
@@ -194,14 +350,17 @@ export async function translatePdf(directory, options, route, signal, onUpdate =
   const input = path.join(directory, 'paper.pdf')
   const config = path.join(directory, 'config.toml')
   await writeFile(config, '# PDF translation job\n')
-  const results = { success: 0, failed: new Set() }
-  const bridge = await openModelBridge(route, signal, results, onUpdate)
+  const results = { failed: new Set() }
+  const bridge = await openModelBridge(route, options, signal, results, onUpdate)
   try {
     const dual = options.mode === 'dual'
     const args = [
       input, '--config-file', config, '--output', directory, '--report-interval', '1',
       '--lang-in', 'auto', '--lang-out', options.target,
-      '--ignore-cache', '--no-auto-extract-glossary',
+      '--no-auto-extract-glossary',
+      // 默认启用引擎自带的译文缓存：同一份 PDF 重跑、或引擎内部重试时不再全价重翻。
+      // 需要干净重译（怀疑缓存串了内容）才用 --no-cache 打开 --ignore-cache。
+      ...(options.noCache ? ['--ignore-cache'] : []),
       '--disable-config-auto-save',
       '--qps', String(route.workers ?? 2), '--pool-max-workers', String(route.workers ?? 2),
       '--openaicompatible', '--openai-compatible-base-url', bridge.baseUrl,
@@ -218,8 +377,8 @@ export async function translatePdf(directory, options, route, signal, onUpdate =
     if (results.failed.size) throw new Error('部分段落未取得译文。请确认所选模型可用，或缩小页码范围后重试。')
     const files = await readdir(directory)
     const output = files.find(name => name.startsWith('paper.') && name.endsWith(dual ? '.dual.pdf' : '.mono.pdf'))
-    if (code !== 0 || !output || !results.success) {
-      if (/scanned|no text|empty text/i.test(diagnostics) || (output && !results.success)) {
+    if (code !== 0 || !output) {
+      if (/scanned|no text|empty text/i.test(diagnostics)) {
         throw new Error('没有找到可翻译的文本。扫描件需先 OCR，或检查选择的页码。')
       }
       if (/password|encrypt/i.test(diagnostics)) throw new Error('请上传已解锁的 PDF。')
@@ -237,6 +396,7 @@ export async function translatePdf(directory, options, route, signal, onUpdate =
     } finally {
       await handle.close()
     }
+    await slimOutputPdf(file)
     return file
   } finally {
     bridge.close()

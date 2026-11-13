@@ -134,13 +134,14 @@ async function main() {
       out: { type: 'string', default: 'translated-pdfs' },
       scratch: { type: 'string' },
       api: { type: 'boolean' },
+      'no-cache': { type: 'boolean' },
       'check-engine': { type: 'boolean' },
       model: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   })
   if (values.help) {
-    console.log('node translate.mjs [--target zh-CN|en|ja|de|fr] [--mode mono|dual] [--pages 1-3,5] [--out DIRECTORY] [--scratch DIRECTORY] [--api [--model ID]] -- FILE.pdf [FILE.pdf ...]')
+    console.log('node translate.mjs [--target zh-CN|en|ja|de|fr] [--mode mono|dual] [--pages 1-3,5] [--out DIRECTORY] [--scratch DIRECTORY] [--api [--model ID]] [--no-cache] -- FILE.pdf [FILE.pdf ...]')
     console.log('node translate.mjs --check-engine')
     return
   }
@@ -185,7 +186,7 @@ async function main() {
     for (const file of positionals) {
       if (batch.signal.aborted) break
       const input = path.resolve(file)
-      const options = { target, mode, pages }
+      const options = { target, mode, pages, noCache: values['no-cache'] }
       const timeout = AbortSignal.timeout(45 * 60_000)
       const signal = AbortSignal.any([batch.signal, timeout])
       let directory
